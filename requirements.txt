@@ -1,0 +1,11 @@
+
+PyMuPDF
+pandas
+numpy
+scikit-learn
+spacy
+fastapi
+uvicorn
+python-multipart
+pydantic
+pytest

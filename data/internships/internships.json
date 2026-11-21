@@ -1,0 +1,18 @@
+[
+    {
+        "id": "INT-001",
+        "title": "Software Development Intern",
+        "organization": "Example Technologies",
+        "description": "Assist in developing and maintaining software applications.",
+        "required_skills": ["Python", "SQL"],
+        "preferred_skills": ["Git", "Docker"],
+        "education_requirements": ["Computer Science or a related qualification"],
+        "minimum_experience_months": 0,
+        "eligibility_criteria": ["Currently enrolled student or recent graduate"],
+        "location": "Nairobi, Kenya",
+        "work_arrangement": "hybrid",
+        "application_deadline": "2026-12-15",
+        "application_url": "https://example.com/apply",
+        "is_active": true
+    }
+]
