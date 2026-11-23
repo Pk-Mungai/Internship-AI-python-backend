@@ -1,7 +1,12 @@
 import tempfile
 from pathlib import Path
-
-from fastapi import UploadFile, File
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    UploadFile,
+    File,
+    Depends,
+)
 
 from config import (
     INTERNSHIP_DATABASE,
@@ -18,13 +23,23 @@ from config import (
 from src.cv_parser import extract_text_from_pdf
 from src.text_cleaner import clean_text
 from src.profile_builder import build_candidate_profile
-from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from src.internship_repository import InternshipRepository
 from src.application_tracker import ApplicationTracker
 from src.recommendation_service import recommend_internships
 from pydantic import BaseModel, Field
 from typing import Literal
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from passlib.context import CryptContext
+
+from database import get_db
+from models import User, CV
+from auth import create_access_token, verify_access_token
+from schemas import UserCreate, UserResponse, LoginRequest, TokenResponse
+from cv import save_and_extract_cv
+
 
 from src.cover_letter_generator import generate_cover_letter
 
@@ -38,7 +53,35 @@ app = FastAPI(
     description=API_DESCRIPTION,
     version=API_VERSION,
 )
+# --------------------------------------------------
+# AUTHENTICATION HELPERS
+# --------------------------------------------------
 
+pwd_context = CryptContext(
+    schemes=["argon2"],
+    deprecated="auto",
+)
+
+bearer_scheme = HTTPBearer()
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+    user_id = verify_access_token(credentials.credentials)
+
+    user = db.query(User).filter(
+        User.user_id == user_id
+    ).first()
+
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="User account not found.",
+        )
+
+    return user
 
 # --------------------------------------------------
 # CORS CONFIGURATION
@@ -97,6 +140,222 @@ class CoverLetterRequest(BaseModel):
     internship_id: str = Field(min_length=1)
     applicant_name: str = "[Your Name]"
     contact_details: str = "[Your Email] | [Your Phone Number]"
+
+# --------------------------------------------------
+# AUTHENTICATION ENDPOINTS
+# --------------------------------------------------
+
+@app.post(
+    "/api/v1/auth/register",
+    response_model=UserResponse,
+    tags=["Authentication"],
+)
+def register_user(
+    request: UserCreate,
+    db: Session = Depends(get_db),
+):
+    user = User(
+        full_name=request.full_name,
+        email=request.email.strip().lower(),
+        password_hash=pwd_context.hash(request.password),
+    )
+
+    try:
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        return user
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email already exists.",
+        )
+
+
+@app.post(
+    "/api/v1/auth/login",
+    response_model=TokenResponse,
+    tags=["Authentication"],
+)
+def login_user(
+    request: LoginRequest,
+    db: Session = Depends(get_db),
+):
+    email = request.email.strip().lower()
+
+    user = db.query(User).filter(
+        User.email == email
+    ).first()
+
+    if user is None or not pwd_context.verify(
+        request.password,
+        user.password_hash,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+        )
+
+    access_token = create_access_token(user.user_id)
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+    }
+
+
+@app.get(
+    "/api/v1/me",
+    response_model=UserResponse,
+    tags=["Authentication"],
+)
+def get_my_account(
+    current_user: User = Depends(get_current_user),
+):
+    return current_user
+# --------------------------------------------------
+# AUTHENTICATED CV UPLOAD
+# --------------------------------------------------
+
+@app.post(
+    "/api/v1/me/cv",
+    tags=["Candidates"],
+)
+async def upload_my_cv(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    saved_file_path = None
+
+    try:
+        filename, file_path, extracted_text = await save_and_extract_cv(
+            file=file,
+            user_id=current_user.user_id,
+        )
+
+        saved_file_path = Path(file_path)
+
+        cleaned_text = clean_text(extracted_text)
+
+        if not cleaned_text:
+            raise HTTPException(
+                status_code=422,
+                detail="No usable text could be extracted from the CV.",
+            )
+
+        candidate_profile = build_candidate_profile(cleaned_text)
+
+        cv_record = CV(
+            user_id=current_user.user_id,
+            file_name=filename,
+            file_path=str(saved_file_path),
+            extracted_text=extracted_text,
+        )
+
+        db.add(cv_record)
+        db.commit()
+        db.refresh(cv_record)
+
+        return {
+            "status": "success",
+            "message": "CV uploaded and saved successfully.",
+            "cv_id": cv_record.cv_id,
+            "filename": filename,
+            "profile": candidate_profile,
+        }
+
+    except HTTPException:
+        db.rollback()
+
+        if saved_file_path and saved_file_path.exists():
+            saved_file_path.unlink()
+
+        raise
+
+    except Exception as error:
+        db.rollback()
+
+        if saved_file_path and saved_file_path.exists():
+            saved_file_path.unlink()
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to upload and save the CV.",
+        ) from error
+
+# --------------------------------------------------
+# PERSONALIZED RECOMMENDATIONS
+# --------------------------------------------------
+
+@app.get(
+    "/api/v1/me/recommendations",
+    tags=["Recommendations"],
+)
+def get_my_recommendations(
+    top_n: int = 10,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if top_n < 1 or top_n > 50:
+        raise HTTPException(
+            status_code=400,
+            detail="top_n must be between 1 and 50.",
+        )
+
+    latest_cv = (
+        db.query(CV)
+        .filter(CV.user_id == current_user.user_id)
+        .order_by(CV.uploaded_at.desc())
+        .first()
+    )
+
+    if latest_cv is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Please upload a CV before requesting recommendations.",
+        )
+
+    try:
+        cleaned_text = clean_text(latest_cv.extracted_text)
+
+        candidate_profile = build_candidate_profile(cleaned_text)
+
+        internships = internship_repository.load_all()
+
+        active_internships = [
+            internship
+            for internship in internships
+            if internship.is_active
+        ]
+
+        recommendations = recommend_internships(
+            candidate_profile=candidate_profile,
+            internships=active_internships,
+            top_n=top_n,
+        )
+
+        return {
+            "status": "success",
+            "count": len(recommendations),
+            "cv_id": latest_cv.cv_id,
+            "recommendations": recommendations,
+        }
+
+    except (TypeError, ValueError) as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error),
+        ) from error
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to generate personalized recommendations.",
+        ) from error
 
 # --------------------------------------------------
 # ROOT ENDPOINT
