@@ -9,3 +9,10 @@ uvicorn
 python-multipart
 pydantic
 pytest
+
+SQLAlchemy
+psycopg2-binary
+python-jose[cryptography]
+python-dotenv
+pypdf
+passlib[argon2]
